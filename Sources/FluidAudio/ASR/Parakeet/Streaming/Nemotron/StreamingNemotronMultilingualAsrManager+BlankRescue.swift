@@ -150,11 +150,20 @@ extension StreamingNemotronMultilingualAsrManager {
         // decode often spends the span's frames emitting the previous
         // sentence's terminal punctuation ("afternoon." + dropped word) —
         // punctuation alone must not mask a swallowed word.
-        let spanEmitted = accumulatedTokenTimings.contains {
-            $0.startTime >= openSec && $0.startTime <= closeSec
-                && Self.containsLexicalContent($0.token)
+        func spanEmitted() -> Bool {
+            accumulatedTokenTimings.contains {
+                $0.startTime >= openSec && $0.startTime <= closeSec
+                    && Self.containsLexicalContent($0.token)
+            }
         }
-        guard !spanEmitted else { return }
+        guard !spanEmitted() else { return }
+        // Never rescue over an open biased speculation: undo it first (its
+        // tokens are not the span's — the span emitted nothing), then look
+        // again at what the unbiased re-decode wrote.
+        if biasSession?.decoder.isSpeculating == true, let tokenizer {
+            try await settleBiasSpeculation(.rescue, tokenizer: tokenizer)
+            guard !spanEmitted() else { return }
+        }
 
         recordDetectedBlankSpan()
         try await rescueDecode(
@@ -208,9 +217,21 @@ extension StreamingNemotronMultilingualAsrManager {
         // callback fires after a successful commit instead.
         let savedPartialCallback = partialCallback
         partialCallback = nil
+        // The rescue decodes with the vocabulary too, but in its own biased
+        // session (fresh match history, its own kept frames) that inherits
+        // the utterance's rewind budget; the live session and matcher state
+        // come back untouched afterwards.
+        let savedBiasSession = biasSession
+        let savedMatchState = vocabularyBias?.matchState
+        biasSession = nil
 
         inBlankRescue = true
         defer {
+            if let rescueStats = biasSession?.decoder.stats, let live = savedBiasSession {
+                live.decoder.adoptStats(rescueStats)
+            }
+            biasSession = savedBiasSession
+            if let savedMatchState { vocabularyBias?.matchState = savedMatchState }
             cacheChannel = savedCacheChannel
             cacheTime = savedCacheTime
             cacheLen = savedCacheLen
@@ -239,6 +260,11 @@ extension StreamingNemotronMultilingualAsrManager {
         try await applyForcedPrefixIfNeeded()
         // Rescue tokens keep their true position on the stream timeline.
         absoluteFrameBase = max(0, spanStartFrame)
+        if let bias = vocabularyBias {
+            vocabularyBias?.resetMatchState()
+            biasSession = try makeBiasSession(
+                bias: bias, stats: savedBiasSession?.decoder.stats ?? NemotronVocabularyBiasStats())
+        }
 
         let chunkSamples = config.chunkSamples
         var audio = span
@@ -257,6 +283,8 @@ extension StreamingNemotronMultilingualAsrManager {
             try await processChunk(Array(audio[offset..<(offset + chunkSamples)]))
             offset += chunkSamples
         }
+        // The span is the rescue's whole utterance: no unfinished term.
+        try await settleBiasSpeculation(.finish, tokenizer: tokenizer)
 
         // Stage: pull the trial decode's output back out of the accumulators.
         // Lang-tag re-emissions carry no user content (and have no timing

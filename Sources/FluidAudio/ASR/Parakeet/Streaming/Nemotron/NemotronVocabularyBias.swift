@@ -111,8 +111,16 @@ final class NemotronVocabularyBias {
     /// Lowercased NFC scalars of the most recent emissions, long enough to
     /// hold any term's partial match.
     private var tail: [Unicode.Scalar] = []
+    /// Absolute scalar position (count of scalars observed since the last
+    /// reset) of `tail[0]`; grows as the tail is trimmed.
+    private var tailStart = 0
+    /// Absolute scalar position before which no match may start. A rewound
+    /// speculation raises it to abandon the match that failed (see
+    /// `NemotronBiasedGreedyDecoder`); 0 otherwise.
+    private var barrier = 0
     private let tailCap: Int
     private var cached: [Candidate]?
+    private var cachedContinuations: [Candidate]?
 
     /// Builds the biasing state, or `nil` when no usable term remains.
     ///
@@ -255,16 +263,91 @@ final class NemotronVocabularyBias {
         guard let piece = pieceById[tokenId] else { return }
         tail.append(contentsOf: piece.unicodeScalars)
         if tail.count > tailCap {
-            tail.removeFirst(tail.count - tailCap)
+            let excess = tail.count - tailCap
+            tail.removeFirst(excess)
+            tailStart += excess
         }
-        cached = nil
+        invalidate()
     }
 
     /// Forget the match state (stream reset / finish). The vocabulary
     /// itself survives, like the selected language does.
     func resetMatchState() {
         tail.removeAll(keepingCapacity: true)
+        tailStart = 0
+        barrier = 0
+        invalidate()
+    }
+
+    private func invalidate() {
         cached = nil
+        cachedContinuations = nil
+    }
+
+    // MARK: - Speculation support (start gate + rewind)
+
+    /// Everything `observe` mutates, so a speculation can restore it.
+    struct MatchState {
+        fileprivate let tail: [Unicode.Scalar]
+        fileprivate let tailStart: Int
+        fileprivate let barrier: Int
+    }
+
+    var matchState: MatchState {
+        get { MatchState(tail: tail, tailStart: tailStart, barrier: barrier) }
+        set {
+            tail = newValue.tail
+            tailStart = newValue.tailStart
+            barrier = newValue.barrier
+            invalidate()
+        }
+    }
+
+    /// Scalars observed since the last reset (the absolute end of the tail).
+    var emittedScalarCount: Int { tailStart + tail.count }
+
+    /// Abandon every match that starts before `position`: from here on only
+    /// a match opened by a later emission is continuable.
+    func abandonMatches(before position: Int) {
+        guard position > barrier else { return }
+        barrier = position
+        invalidate()
+    }
+
+    /// Whether `tokenId` is a word-initial (`▁`-led) text piece — the start
+    /// gate only lets a fresh term open where the model itself opens a word.
+    func isWordStart(_ tokenId: Int) -> Bool {
+        pieceById[tokenId]?.unicodeScalars.first == Self.marker
+    }
+
+    /// Match status of a speculation that began at absolute scalar
+    /// `position`: `alive` when some match that starts at or before
+    /// `position` (so it contains the speculative piece) is still a prefix
+    /// of a term, `completed` when one of them spells a whole term.
+    func speculationStatus(coveringScalar position: Int) -> (alive: Bool, completed: Bool) {
+        let end = emittedScalarCount
+        let lowest = max(barrier, tailStart, end - tailCap)
+        let highest = min(position, end - 1)
+        guard lowest <= highest else { return (false, false) }
+        var alive = false
+        for start in lowest...highest {
+            var node = trieRoot
+            var matched = true
+            for i in (start - tailStart)..<tail.count {
+                guard let next = node.children[tail[i].value] else {
+                    matched = false
+                    break
+                }
+                node = next
+            }
+            guard matched else { continue }
+            alive = true
+            let length = end - start
+            if node.entryIndices.contains(where: { entries[$0].pieceForm.count == length }) {
+                return (true, true)
+            }
+        }
+        return (alive, false)
     }
 
     /// The boostable continuations at the current match state, one entry
@@ -277,12 +360,18 @@ final class NemotronVocabularyBias {
     /// tail suffix through the piece-form trie). The candidates are every
     /// vocab piece equal to a prefix of the term's remaining text from any
     /// of those offsets.
-    func candidates() -> [Candidate] {
-        if let cached { return cached }
-        var best = freshStartCandidates
+    ///
+    /// `includeFreshStarts: false` returns only continuations of open
+    /// matches — what the start gate allows where the model is not itself
+    /// starting a word.
+    func candidates(includeFreshStarts: Bool = true) -> [Candidate] {
+        if includeFreshStarts, let cached { return cached }
+        if !includeFreshStarts, let cachedContinuations { return cachedContinuations }
+        var best = includeFreshStarts ? freshStartCandidates : [:]
         if !tail.isEmpty {
             let maxOffset = min(tail.count, tailCap)
-            for start in (tail.count - maxOffset)..<tail.count {
+            let lowest = max(tail.count - maxOffset, barrier - tailStart)
+            for start in min(max(0, lowest), tail.count)..<tail.count {
                 var node = trieRoot
                 var matched = true
                 for i in start..<tail.count {
@@ -301,7 +390,11 @@ final class NemotronVocabularyBias {
             }
         }
         let result = best.map { Candidate(tokenId: $0.key, boost: $0.value) }
-        cached = result
+        if includeFreshStarts {
+            cached = result
+        } else {
+            cachedContinuations = result
+        }
         return result
     }
 
@@ -363,8 +456,13 @@ extension StreamingNemotronMultilingualAsrManager {
     /// lazily from the model directory when the tier priority skipped it,
     /// and when none exists the vocabulary is rejected with an error log
     /// rather than silently half-applied.
+    ///
+    /// Call it between utterances (before `reset()` or after `finish()`):
+    /// a mid-utterance change drops the open speculation's bookkeeping and
+    /// the matcher's history.
     public func setCustomVocabulary(_ terms: [CustomVocabularyTerm]) async {
         vocabularyTerms = terms
+        biasSession = nil
         await rebuildVocabularyBias()
     }
 

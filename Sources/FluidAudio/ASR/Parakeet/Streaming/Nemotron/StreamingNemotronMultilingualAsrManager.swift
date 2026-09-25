@@ -95,6 +95,11 @@ public actor StreamingNemotronMultilingualAsrManager {
     // rebuilt whenever a tokenizer becomes available.
     internal var vocabularyTerms: [CustomVocabularyTerm] = []
     internal var vocabularyBias: NemotronVocabularyBias?
+    // Speculation + rewind state of the biased decode (see
+    // +BiasedDecode.swift); nil when no vocabulary is active or between
+    // utterances. `lastBiasStats` keeps the finished utterance's counters.
+    internal var biasSession: NemotronBiasDecodeSession?
+    internal var lastBiasStats = NemotronVocabularyBiasStats()
     // Directory loadModels() read from, for lazy vocabulary-driven loads.
     internal var modelDirectory: URL?
 
@@ -820,6 +825,8 @@ public actor StreamingNemotronMultilingualAsrManager {
         audioBufferOffset = 0
         firstDetectedLanguage = nil
         vocabularyBias?.resetMatchState()
+        biasSession = nil
+        lastBiasStats = NemotronVocabularyBiasStats()
         do {
             try resetStates()
         } catch {
@@ -1036,6 +1043,11 @@ public actor StreamingNemotronMultilingualAsrManager {
             audioBufferOffset = 0
         }
 
+        // The final text must not carry an unfinished biased term: undo an
+        // open speculation before the transcript (and the trailing rescue)
+        // reads the tokens.
+        try await settleBiasSpeculation(.finish, tokenizer: tokenizer)
+
         // Issue #838: a trailing speech span that decoded to all-blank gets
         // one fresh-state re-decode before the transcript is assembled.
         try await finalizeRescueSpanIfNeeded()
@@ -1055,6 +1067,10 @@ public actor StreamingNemotronMultilingualAsrManager {
         accumulatedTokenTimings.removeAll()
         // The emitted-token tail must follow the accumulated ids it mirrors.
         vocabularyBias?.resetMatchState()
+        if let session = biasSession {
+            lastBiasStats = session.decoder.stats
+            biasSession = nil
+        }
 
         if appendTerminalPunctuation {
             return Self.tidyTerminalPunctuation(

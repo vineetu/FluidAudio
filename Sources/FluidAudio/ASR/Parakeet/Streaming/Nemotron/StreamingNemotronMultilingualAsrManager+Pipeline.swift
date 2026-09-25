@@ -277,6 +277,30 @@ extension StreamingNemotronMultilingualAsrManager {
         )
         var newTokens: [Int] = []
 
+        // Vocabulary active: the speculation-and-rewind decode (start gate,
+        // cross-chunk rewind, both the per-frame and the speculative fast
+        // path as step providers). The unbiased paths below stay untouched.
+        if let bias = vocabularyBias {
+            let changed = try await decodeChunkWithBias(
+                encoded: encoded, encoderProj: encoderProj, numEncoderFrames: numEncoderFrames,
+                bias: bias, tokenizer: tokenizer)
+            self.decNanos &+= DispatchTime.now().uptimeNanoseconds &- decStart
+            if changed, let callback = partialCallback {
+                callback(tokenizer.decode(ids: accumulatedTokenIds).text)
+            }
+            if let nextEnc = try await nextEncFuture {
+                self.prefetchedEncoded = nextEnc.encoded
+                self.prefetchedEncoderProj = nextEnc.encoderProj
+                self.cacheChannel = nextEnc.cacheChannel
+                self.cacheTime = nextEnc.cacheTime
+                self.cacheLen = nextEnc.cacheLen
+                self.melCache = nextEnc.newMelCache
+            }
+            absoluteFrameBase += numEncoderFrames
+            processedChunks += 1
+            return
+        }
+
         // SMART SPECULATIVE BLANK path — speculative scan over K=8 frames
         // per batched joint call. Blank streaks consume 1 joint call per
         // K frames vs K calls in the standard per-token loop.

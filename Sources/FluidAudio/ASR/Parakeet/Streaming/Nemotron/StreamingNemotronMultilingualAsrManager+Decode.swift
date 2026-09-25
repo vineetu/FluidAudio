@@ -525,12 +525,14 @@ extension StreamingNemotronMultilingualAsrManager {
     /// tokens. Uses `rawToken(for:)` (NOT `tokenizerPiece`, which strips the `▁`
     /// word-boundary marker) so callers can reconstruct word boundaries.
     internal func appendTokenTiming(
-        _ tokenId: Int, frameInChunk: Int, tokenizer: NemotronMultilingualTokenizer
+        _ tokenId: Int, frameInChunk: Int, tokenizer: NemotronMultilingualTokenizer,
+        observeBias: Bool = true
     ) {
         // Every decode path commits an emission through here, which makes it
         // the one place the hotword matcher has to watch. Lang tags carry no
-        // piece text (the bias skips special pieces itself).
-        vocabularyBias?.observe(tokenId)
+        // piece text (the bias skips special pieces itself). The biased
+        // decode observes inside its speculation state machine instead.
+        if observeBias { vocabularyBias?.observe(tokenId) }
         guard !config.langTagTokenIds.contains(tokenId) else { return }
         let startTime =
             Double(absoluteFrameBase + frameInChunk) * ASRConstants.secondsPerEncoderFrame
