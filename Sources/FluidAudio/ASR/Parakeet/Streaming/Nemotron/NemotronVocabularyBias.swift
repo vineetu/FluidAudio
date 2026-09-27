@@ -97,6 +97,16 @@ final class NemotronVocabularyBias {
     /// `effectiveBoost`).
     static let maxBoost: Float = 6.0
 
+    /// A continuation of an open match gets this multiple of the term's
+    /// bonus; the start keeps the plain bonus. Starting a term is the risky
+    /// decision, finishing one the audio already began is not — and with
+    /// rewind an unfinished term costs nothing, so continuations can be
+    /// stronger. Jot for Windows uses the same 3:2 ratio (start 2.0,
+    /// continue 3.0). On LibriSpeech test-clean with 100-word biasing lists
+    /// (Le et al. 2021), start 3.5 took rare-word WER 14.1% -> 7.3% while
+    /// common-word WER went 2.08% -> 1.98%.
+    static let continuationScale: Float = 1.5
+
     private let entries: [Entry]
     private let trieRoot: TrieNode
     /// Offset-0 candidates for every term — decode-state independent, so
@@ -385,7 +395,8 @@ final class NemotronVocabularyBias {
                 let offset = tail.count - start
                 for index in node.entryIndices {
                     Self.accumulate(
-                        from: entries[index], offset: offset, idsByPiece: idsByPiece, into: &best)
+                        from: entries[index], offset: offset, idsByPiece: idsByPiece, into: &best,
+                        scale: Self.continuationScale)
                 }
             }
         }
@@ -401,7 +412,8 @@ final class NemotronVocabularyBias {
     /// Merge the boostable pieces that continue `entry` from `offset` —
     /// every vocab piece equal to a prefix of `pieceForm[offset...]`.
     private static func accumulate(
-        from entry: Entry, offset: Int, idsByPiece: [String: [Int]], into best: inout [Int: Float]
+        from entry: Entry, offset: Int, idsByPiece: [String: [Int]], into best: inout [Int: Float],
+        scale: Float = 1
     ) {
         let form = entry.pieceForm
         guard offset < form.count else { return }
@@ -425,8 +437,8 @@ final class NemotronVocabularyBias {
             // one letter at a time, and an unanchored CJK term's single
             // characters stay (each is a selective full syllable).
             if offset == 0, form.first == marker, letters < 2 { continue }
-            for id in ids where entry.boost > best[id, default: -.infinity] {
-                best[id] = entry.boost
+            for id in ids where entry.boost * scale > best[id, default: -.infinity] {
+                best[id] = entry.boost * scale
             }
         }
     }
@@ -608,3 +620,4 @@ extension StreamingNemotronMultilingualAsrManager {
             Data("bias-flip: '\(plainPiece)'(\(plainLogit)) -> '\(pickedPiece)'(\(pickedLogit))\n".utf8))
     }
 }
+

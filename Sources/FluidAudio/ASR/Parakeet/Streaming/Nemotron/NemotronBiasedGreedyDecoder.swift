@@ -47,8 +47,9 @@ struct NemotronStepLogits {
 ///   non-blank, word-initial (`▁`) piece, outside a cooldown, and not at a
 ///   banned `(frame, tokenCount)` position. Biasing re-ranks which word is
 ///   written; it never writes a term out of silence or splits a word the
-///   model is part-way through. Continuations of an open match are not
-///   gated (they may overtake blank).
+///   model is part-way through, and no second term opens while a
+///   speculation is open. Continuations of an open match are not gated
+///   (they may overtake blank) and get `continuationScale` × the bonus.
 /// - **Speculation.** The first flip (biased pick != plain argmax) snapshots
 ///   the decoder: frame, symbol index, last token, LSTM state, accumulator
 ///   lengths, and the matcher's state. When a match containing the flipped
@@ -181,8 +182,11 @@ final class NemotronBiasedGreedyDecoder<State> {
         var choice = plain
         if !stats.biasDisabled {
             let key = Key(frame: frame, tokenCount: idsCount)
+            // A fresh start while a speculation is open could only kill that
+            // speculation's own match, so only continuations compete then.
             let allowStart =
-                plain != blankId && bias.isWordStart(plain) && !cooldown && !banned.contains(key)
+                plain != blankId && bias.isWordStart(plain) && !cooldown && speculation == nil
+                && !banned.contains(key)
             let candidates = bias.candidates(includeFreshStarts: allowStart)
             if !candidates.isEmpty {
                 choice = StreamingNemotronMultilingualAsrManager.pickBiased(

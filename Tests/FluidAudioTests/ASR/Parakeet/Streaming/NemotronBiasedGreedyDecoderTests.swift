@@ -238,6 +238,32 @@ final class NemotronBiasedGreedyDecoderTests: XCTestCase {
         XCTAssertTrue(biased.stats.biasDisabled)
     }
 
+    func testNoSecondTermStartsWhileSpeculating() {
+        // During the "▁tor" speculation the model starts a word where "▁okay"
+        // (another term) is close. Opening it there would only kill "▁tor",
+        // so it is not offered: "▁ran" breaks the match and the rewind comes
+        // back to frame 1. Only then, with nothing open, may "▁okay" start at
+        // frame 2 — one flip for it instead of two.
+        var script = Script(frames: 4)
+        script.at(1, 0, [6: 3, 4: 1])
+        script.at(2, 0, [7: 5, 10: 2])
+        let biased = run(script, terms: ["torvane", "okay"], chunk: 4)
+        XCTAssertEqual(biased.ids, [6, 10])
+        XCTAssertEqual(biased.stats.flips, 2)
+        XCTAssertEqual(biased.stats.rewinds, 1)
+        XCTAssertEqual(biased.stats.kept, 1)
+    }
+
+    func testContinuationGetsScaledBonus() {
+        let bias = makeBias(["torvane"], boost: 2)
+        let fresh = Dictionary(uniqueKeysWithValues: bias.candidates().map { ($0.tokenId, $0.boost) })
+        XCTAssertEqual(fresh[4], 2)
+        bias.observe(4)  // ▁tor
+        let cont = Dictionary(
+            uniqueKeysWithValues: bias.candidates(includeFreshStarts: false).map { ($0.tokenId, $0.boost) })
+        XCTAssertEqual(cont[3], 2 * NemotronVocabularyBias.continuationScale)
+    }
+
     // MARK: - Chunk edges and end of utterance
 
     func testCrossChunkRewindMatchesSinglePass() {
