@@ -95,6 +95,9 @@ public actor StreamingNemotronMultilingualAsrManager {
     // rebuilt whenever a tokenizer becomes available.
     internal var vocabularyTerms: [CustomVocabularyTerm] = []
     internal var vocabularyBias: NemotronVocabularyBias?
+    // Learned (original -> term) corrections, bound to `vocabularyBias`
+    // whenever it is rebuilt (see `setLearnedPairs`).
+    internal var learnedPairs: [NemotronLearnedPair] = []
     // Speculation + rewind state of the biased decode (see
     // +BiasedDecode.swift); nil when no vocabulary is active or between
     // utterances. `lastBiasStats` keeps the finished utterance's counters.

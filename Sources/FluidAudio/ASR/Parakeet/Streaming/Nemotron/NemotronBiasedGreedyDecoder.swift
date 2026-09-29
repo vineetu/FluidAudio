@@ -62,6 +62,15 @@ struct NemotronStepLogits {
 /// - **Budget.** After `maxRewinds` rewinds in one utterance biasing is
 ///   switched off (rewinding is not — an open speculation is still undone).
 ///
+/// Learned pairs (`NemotronVocabularyBias.learnedPairPush`) add a push at
+/// each pair's divergence point on top of the term bonus; the flip it causes
+/// opens a speculation like any other. A speculation a pair pushed has two
+/// extra outcomes, both a `.replaced` rewrite of its word: kept, the word is
+/// re-spelled in the term's own casing (the matcher is case-folded, so the
+/// model may have written "claudE"); and when it reaches a word boundary —
+/// the next word, word-ending punctuation, or the end of the utterance — one
+/// letter short of the term, the term is committed instead of rewinding.
+///
 /// The decoder is a synchronous state machine: the driver asks
 /// `needsStep(until:)`, runs the model for (`frame`, `symbol`, `token`,
 /// `state`), and hands the logits to `consume`, applying the returned
@@ -89,11 +98,26 @@ final class NemotronBiasedGreedyDecoder<State> {
         /// Truncate the accumulators to these lengths; decoding resumes at
         /// absolute `frame`.
         case rewound(idsCount: Int, timingsCount: Int, frame: Int)
+        /// Replace the accumulators from these lengths on with `tokens`,
+        /// spread over the replaced word's time span (which runs through
+        /// absolute `wordEndFrame` when set — a piece not appended yet), then
+        /// append `thenEmit` if set. Decoding continues where it is.
+        case replaced(
+            idsFrom: Int, timingsFrom: Int, tokens: [Int], wordEndFrame: Int?,
+            thenEmit: (tokenId: Int, frame: Int)?)
     }
 
     private struct Key: Hashable {
         let frame: Int
         let tokenCount: Int
+    }
+
+    /// The word being written: where it starts in the driver's accumulators
+    /// and the ids written into it.
+    private struct Word {
+        let ids: Int
+        let timings: Int
+        var tokens: [Int]
     }
 
     private struct Snapshot {
@@ -107,6 +131,11 @@ final class NemotronBiasedGreedyDecoder<State> {
         /// Absolute scalar position of the first speculative piece.
         let scalarPosition: Int
         let key: Key
+        /// The word being written before the snapshot's step (restored on
+        /// rewind) and the start of the word the first speculative piece
+        /// lands in (nil when unknown).
+        let word: Word?
+        let speculationWordIds: Int?
     }
 
     let bias: NemotronVocabularyBias
@@ -128,6 +157,11 @@ final class NemotronBiasedGreedyDecoder<State> {
     private var speculation: Snapshot?
     private var banned: Set<Key> = []
     private var cooldown = false
+    /// Nil until this decoder sees a word start: a session that begins
+    /// mid-word (a rescue span) never rewrites text it did not decode.
+    private var word: Word?
+    /// The open speculation was opened or flipped by a learned pair.
+    private var pairPushed = false
     private(set) var stats = NemotronVocabularyBiasStats()
 
     init(
@@ -188,7 +222,19 @@ final class NemotronBiasedGreedyDecoder<State> {
                 plain != blankId && bias.isWordStart(plain) && !cooldown && speculation == nil
                 && !banned.contains(key)
             let candidates = bias.candidates(includeFreshStarts: allowStart)
-            if !candidates.isEmpty {
+            if let push = bias.learnedPairPush(plain: plain, blankId: blankId, allowStart: allowStart) {
+                var boosts = push.boosts
+                for candidate in candidates where candidate.boost > boosts[candidate.tokenId, default: -.infinity] {
+                    boosts[candidate.tokenId] = candidate.boost
+                }
+                choice = Self.pickWithPenalties(
+                    plain: plain, boosts: boosts, penalties: push.penalties, count: logits.count,
+                    logit: logits.logit)
+                if choice != plain {
+                    pairPushed = true
+                    trace?("pair-push: '\(piece(plain))' -> '\(piece(choice))'")
+                }
+            } else if !candidates.isEmpty {
                 choice = StreamingNemotronMultilingualAsrManager.pickBiased(
                     plain: plain, candidates: candidates, count: logits.count, logit: logits.logit)
             }
@@ -201,7 +247,8 @@ final class NemotronBiasedGreedyDecoder<State> {
                     speculation = Snapshot(
                         frame: frame, symbol: symbol, token: token, state: state,
                         idsCount: idsCount, timingsCount: timingsCount, match: bias.matchState,
-                        scalarPosition: bias.emittedScalarCount, key: key)
+                        scalarPosition: bias.emittedScalarCount, key: key, word: word,
+                        speculationWordIds: bias.isWordStart(choice) ? idsCount : word?.ids)
                     stats.speculations += 1
                     trace?("bias-spec: open at frame \(frame) symbol \(symbol)")
                 }
@@ -219,6 +266,15 @@ final class NemotronBiasedGreedyDecoder<State> {
         state = stateOut
         symbol += 1
         cooldown = false
+        let startsWord = bias.isWordStart(choice)
+        let endsWord = startsWord || bias.isWordEndingPunctuation(choice)
+        let finishedWord = word
+        let finishedText = bias.writtenWord
+        if startsWord {
+            word = Word(ids: idsCount, timings: timingsCount, tokens: [choice])
+        } else {
+            word?.tokens.append(choice)
+        }
         bias.observe(choice)
 
         if let open = speculation {
@@ -227,7 +283,37 @@ final class NemotronBiasedGreedyDecoder<State> {
                 speculation = nil
                 stats.kept += 1
                 trace?("bias-keep: term completed at frame \(emittedAt)")
+                if pairPushed, let current = word, current.ids == open.speculationWordIds,
+                    let text = bias.writtenWord, let cased = bias.casedTermTokens(for: text),
+                    cased != current.tokens, current.tokens.allSatisfy(bias.isText)
+                {
+                    pairPushed = false
+                    word = Word(ids: current.ids, timings: current.timings, tokens: cased)
+                    trace?("pair-recase at frame \(emittedAt)")
+                    return .replaced(
+                        idsFrom: current.ids, timingsFrom: current.timings, tokens: cased,
+                        wordEndFrame: emittedAt, thenEmit: nil)
+                }
+                pairPushed = false
             } else if !status.alive {
+                if pairPushed, endsWord, let written = finishedWord, written.ids == open.speculationWordIds,
+                    written.tokens.allSatisfy(bias.isText), let text = finishedText,
+                    let near = bias.nearCompletion(of: text)
+                {
+                    speculation = nil
+                    pairPushed = false
+                    stats.kept += 1
+                    bias.renameWrittenWord(to: near.form, writtenLength: text.count, ended: startsWord)
+                    let termEnd = written.ids + near.tokens.count
+                    word =
+                        startsWord
+                        ? Word(ids: termEnd, timings: written.timings + near.tokens.count, tokens: [choice])
+                        : Word(ids: written.ids, timings: written.timings, tokens: near.tokens + [choice])
+                    trace?("pair-near-accept at frame \(emittedAt)")
+                    return .replaced(
+                        idsFrom: written.ids, timingsFrom: written.timings, tokens: near.tokens,
+                        wordEndFrame: nil, thenEmit: (choice, emittedAt))
+                }
                 stats.divergedRewinds += 1
                 return rewind()
             }
@@ -235,10 +321,53 @@ final class NemotronBiasedGreedyDecoder<State> {
         return .emitted(tokenId: choice, frame: emittedAt)
     }
 
+    /// Argmax of `logit + boost - penalty`. When the plain argmax is itself
+    /// penalized any token may win, so every id is scanned.
+    static func pickWithPenalties(
+        plain: Int, boosts: [Int: Float], penalties: [Int: Float], count: Int, logit: (Int) -> Float
+    ) -> Int {
+        var bestId = plain
+        var bestScore = -Float.infinity
+        if penalties[plain] == nil {
+            bestScore = logit(plain)
+            for (id, boost) in boosts where id < count {
+                let score = logit(id) + boost - (penalties[id] ?? 0)
+                if score > bestScore {
+                    bestScore = score
+                    bestId = id
+                }
+            }
+            return bestId
+        }
+        for id in 0..<count {
+            let score = logit(id) + (boosts[id] ?? 0) - (penalties[id] ?? 0)
+            if score > bestScore {
+                bestScore = score
+                bestId = id
+            }
+        }
+        return bestId
+    }
+
     /// Undo the open speculation (no-op without one). Decoding then resumes
     /// from its snapshot with the start banned there.
     func resolveSpeculation(_ reason: ResolveReason) -> Outcome? {
-        guard speculation != nil else { return nil }
+        guard let open = speculation else { return nil }
+        // The end of the utterance (or rescue span) ends the word too.
+        if reason == .finish, pairPushed, let current = word, current.ids == open.speculationWordIds,
+            current.tokens.allSatisfy(bias.isText), let text = bias.writtenWord,
+            let near = bias.nearCompletion(of: text)
+        {
+            speculation = nil
+            pairPushed = false
+            stats.kept += 1
+            bias.renameWrittenWord(to: near.form, writtenLength: text.count, ended: false)
+            word = Word(ids: current.ids, timings: current.timings, tokens: near.tokens)
+            trace?("pair-near-accept at the end of the utterance")
+            return .replaced(
+                idsFrom: current.ids, timingsFrom: current.timings, tokens: near.tokens, wordEndFrame: nil,
+                thenEmit: nil)
+        }
         switch reason {
         case .deadline: stats.deadlineRewinds += 1
         case .finish: stats.finishRewinds += 1
@@ -261,6 +390,8 @@ final class NemotronBiasedGreedyDecoder<State> {
     private func rewind() -> Outcome {
         guard let snapshot = speculation else { preconditionFailure("rewind without speculation") }
         speculation = nil
+        pairPushed = false
+        word = snapshot.word
         frame = snapshot.frame
         symbol = snapshot.symbol
         token = snapshot.token

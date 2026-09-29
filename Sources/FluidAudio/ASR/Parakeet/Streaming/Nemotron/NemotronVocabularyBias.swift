@@ -52,6 +52,11 @@ import Foundation
 /// boundary keeps its bias. Verified by a boundary-phase sweep — leading
 /// silence stepped through a full chunk period leaves term recovery intact
 /// at every phase.
+///
+/// Learned pairs (`setLearnedPairs`) add a targeted push for corrections
+/// the user has made before: where the decode is writing a known
+/// misrecognition, the correction's spelling is pushed at exactly the point
+/// the two diverge — see `learnedPairPush`.
 final class NemotronVocabularyBias {
 
     /// One boostable token continuation at the current match state.
@@ -89,12 +94,12 @@ final class NemotronVocabularyBias {
     /// (`ContextBiasingConstants.rescorerConfig`).
     static let defaultBoost: Float = 4.5
 
-    /// Ceiling for per-term `weight` overrides. `CustomVocabularyTerm.weight`
-    /// predates this engine and is set to 10.0 by the simple text-list
-    /// loader — a CTC-rescoring scale, not a per-token logit bonus. Applied
-    /// raw it would over-bias badly (degradation is measurable from 6.0),
-    /// so weights above this fall back to `defaultBoost` (see
-    /// `effectiveBoost`).
+    /// Ceiling for per-term `weight` overrides: larger weights are clamped
+    /// to it (see `effectiveBoost`). Applied raw, a large weight over-biases
+    /// badly — degradation is measurable from 6.0 on the issue #841 rig.
+    /// `CustomVocabularyTerm.weight` predates this engine and the simple
+    /// text-list loader sets it to 10.0 (a CTC-rescoring scale), so terms
+    /// from that loader bias at this ceiling.
     static let maxBoost: Float = 6.0
 
     /// A continuation of an open match gets this multiple of the term's
@@ -132,6 +137,17 @@ final class NemotronVocabularyBias {
     private var cached: [Candidate]?
     private var cachedContinuations: [Candidate]?
 
+    /// Case-preserved NFC piece text → token id, for spelling a learned
+    /// pair's term in its own casing, and the longest such piece.
+    private let casedIdByPiece: [String: Int]
+    private let maxCasedPieceLength: Int
+    private var learnedPairs: [LearnedPair] = []
+    /// The word written before the current one and the current word so far
+    /// (lowercased NFC scalars, `▁`-led), untruncated up to
+    /// `maxTrackedWordLength` — the word-level view learned pairs need.
+    private var previousWord: [Unicode.Scalar] = []
+    private var wordSoFar: [Unicode.Scalar] = []
+
     /// Builds the biasing state, or `nil` when no usable term remains.
     ///
     /// - Parameters:
@@ -162,18 +178,25 @@ final class NemotronVocabularyBias {
 
         var idsByPiece: [String: [Int]] = [:]
         var pieceById: [Int: String] = [:]
+        var casedIdByPiece: [String: Int] = [:]
+        var maxCasedPieceLength = 1
         for (id, piece) in pieces {
             // Special tokens (`<unk>`, `<en-US>`, …) are not text the
             // decoder spells words with; letting one into the index would
             // boost it, and letting one into the tail would corrupt the
             // match position.
             if piece.hasPrefix("<") && piece.hasSuffix(">") { continue }
+            let cased = piece.precomposedStringWithCanonicalMapping
+            if casedIdByPiece[cased].map({ id < $0 }) ?? true { casedIdByPiece[cased] = id }
+            maxCasedPieceLength = max(maxCasedPieceLength, cased.unicodeScalars.count)
             let folded = piece.lowercased().precomposedStringWithCanonicalMapping
             idsByPiece[folded, default: []].append(id)
             pieceById[id] = folded
         }
         self.idsByPiece = idsByPiece
         self.pieceById = pieceById
+        self.casedIdByPiece = casedIdByPiece
+        self.maxCasedPieceLength = maxCasedPieceLength
 
         let root = TrieNode()
         for (index, entry) in entries.enumerated() {
@@ -205,15 +228,14 @@ final class NemotronVocabularyBias {
         !usableSurfaces(of: term, defaultBoost: defaultBoost).isEmpty
     }
 
-    /// The per-token bonus a term will actually receive: its `weight` when
-    /// set and within `(0, maxBoost]`, the default otherwise. A weight above
-    /// `maxBoost` was tuned for the CTC rescoring scale (the simple text-list
-    /// loader assigns 10.0 to every term), not for this engine — treating it
-    /// as "untuned" and using the measured default beats pinning those terms
-    /// to the aggressive ceiling.
+    /// The per-token bonus a term will actually receive: its `weight`
+    /// clamped to `maxBoost` when set, the default otherwise. A weight of 0 or
+    /// less disables the term. The clamp covers the simple text-list loader
+    /// too: its `CustomVocabularyTerm.weight` of 10.0 (a CTC rescoring value)
+    /// biases at 6.0 here.
     static func effectiveBoost(of term: CustomVocabularyTerm, defaultBoost: Float = defaultBoost) -> Float {
-        guard let weight = term.weight, weight <= maxBoost else { return defaultBoost }
-        return weight
+        guard let weight = term.weight else { return defaultBoost }
+        return min(weight, maxBoost)
     }
 
     /// The surfaces of `term` (text + aliases) that pass the length and
@@ -271,6 +293,13 @@ final class NemotronVocabularyBias {
     /// Call for every committed non-blank emission, in order.
     func observe(_ tokenId: Int) {
         guard let piece = pieceById[tokenId] else { return }
+        if piece.unicodeScalars.first == Self.marker {
+            previousWord = wordSoFar
+            wordSoFar.removeAll(keepingCapacity: true)
+        }
+        if wordSoFar.count <= Self.maxTrackedWordLength {
+            wordSoFar.append(contentsOf: piece.unicodeScalars)
+        }
         tail.append(contentsOf: piece.unicodeScalars)
         if tail.count > tailCap {
             let excess = tail.count - tailCap
@@ -284,6 +313,8 @@ final class NemotronVocabularyBias {
     /// itself survives, like the selected language does.
     func resetMatchState() {
         tail.removeAll(keepingCapacity: true)
+        previousWord.removeAll()
+        wordSoFar.removeAll()
         tailStart = 0
         barrier = 0
         invalidate()
@@ -294,6 +325,202 @@ final class NemotronVocabularyBias {
         cachedContinuations = nil
     }
 
+    // MARK: - Learned pairs
+
+    /// Extra log-prob push a learned pair applies at its divergence point:
+    /// `+push` on the term's continuation, `-push` on the original's
+    /// diverging piece. Measured on LibriSpeech natural misrecognition pairs
+    /// (the decoder's own substitution errors, learned on a TUNE split):
+    /// TEST recall of the corrected word went 0.5% -> 45.7% with 0 collateral
+    /// false insertions over 2620 utterances.
+    static let learnedPairPush: Float = 10.0
+
+    /// Words longer than this (scalars, with the `▁`) are not tracked for
+    /// learned pairs; a pair whose forms exceed it is dropped.
+    private static let maxTrackedWordLength = 64
+
+    private struct LearnedPair {
+        /// Piece form of the misrecognition (`"▁cloud"`).
+        let original: [Unicode.Scalar]
+        /// The vocabulary entry for the correction.
+        let term: Entry
+        /// The term spelled with its own casing (`▁C` `la` `ude`), nil when
+        /// the vocabulary cannot spell it.
+        let casedTokens: [Int]?
+    }
+
+    /// Per-token adjustments of one step's learned-pair push.
+    struct PairPush {
+        var boosts: [Int: Float] = [:]
+        var penalties: [Int: Float] = [:]
+    }
+
+    /// Bind learned `(original → term)` pairs. A pair applies only when
+    /// both sides are single words in a space-delimited script, the original
+    /// passes the same length guard terms do, and the term is itself in the
+    /// vocabulary (the push rides on the term's own entry — it never writes
+    /// an unknown word). Other pairs are ignored.
+    func setLearnedPairs(_ pairs: [NemotronLearnedPair]) {
+        learnedPairs = pairs.compactMap { pair in
+            let original = Self.pieceForm(pair.original)
+            let termForm = Self.pieceForm(pair.term)
+            guard Self.isSingleAnchoredWord(original), Self.isSingleAnchoredWord(termForm),
+                original != termForm, original.count - 1 >= Self.minTermLength,
+                original.count <= Self.maxTrackedWordLength, termForm.count <= Self.maxTrackedWordLength,
+                let term = entries.filter({ $0.pieceForm == termForm }).max(by: { $0.boost < $1.boost })
+            else { return nil }
+            return LearnedPair(
+                original: original, term: term, casedTokens: casedSpelling(of: pair.term, form: termForm))
+        }
+    }
+
+    var hasLearnedPairs: Bool { !learnedPairs.isEmpty }
+
+    private static func isSingleAnchoredWord(_ form: [Unicode.Scalar]) -> Bool {
+        form.first == marker && !form.dropFirst().contains(marker)
+    }
+
+    private static func hasPrefix(_ scalars: [Unicode.Scalar], _ prefix: [Unicode.Scalar]) -> Bool {
+        prefix.count <= scalars.count && scalars[..<prefix.count].elementsEqual(prefix)
+    }
+
+    /// `term` spelled with case-preserved pieces (greedy longest match), or
+    /// nil when some character has no piece or the spelling does not fold
+    /// back to `form`.
+    private func casedSpelling(of term: String, form: [Unicode.Scalar]) -> [Int]? {
+        let text = term.precomposedStringWithCanonicalMapping.trimmingCharacters(in: .whitespaces)
+        let scalars = [Self.marker] + Array(text.unicodeScalars)
+        var ids: [Int] = []
+        var index = 0
+        while index < scalars.count {
+            var length = min(maxCasedPieceLength, scalars.count - index)
+            var found: Int?
+            while length > 0 {
+                var piece = ""
+                piece.unicodeScalars.append(contentsOf: scalars[index..<(index + length)])
+                if let id = casedIdByPiece[piece] {
+                    found = id
+                    break
+                }
+                length -= 1
+            }
+            guard let id = found else { return nil }
+            ids.append(id)
+            index += length
+        }
+        let folded = ids.flatMap { pieceById[$0].map { Array($0.unicodeScalars) } ?? [] }
+        return folded == form ? ids : nil
+    }
+
+    /// The word being written (`▁`-led, fully tracked), or nil.
+    var writtenWord: [Unicode.Scalar]? {
+        wordSoFar.first == Self.marker && wordSoFar.count <= Self.maxTrackedWordLength ? wordSoFar : nil
+    }
+
+    /// The learned-pair push for this step, or nil when no pair is at its
+    /// divergence point. A pair diverges where the plain argmax continues
+    /// the original but not the term from a spelling both share — the word
+    /// so far, or the empty word when the argmax opens a word (then only
+    /// where a term may start, `allowStart`) — or where the argmax ends the
+    /// word (blank or a `▁` piece) exactly as the original ends while the
+    /// term goes on. A pair never fires in its term's own word or the word
+    /// right after it: the original's audio is still under the decoder there
+    /// (measured without this rule as "seating seating seating").
+    func learnedPairPush(plain: Int, blankId: Int, allowStart: Bool) -> PairPush? {
+        guard !learnedPairs.isEmpty else { return nil }
+        var plainPiece: [Unicode.Scalar]?
+        if plain != blankId {
+            guard let piece = pieceById[plain] else { return nil }
+            plainPiece = Array(piece.unicodeScalars)
+        }
+        let endsWord = plainPiece.map { $0.first == Self.marker } ?? true
+        // A match abandoned by a rewind stays abandoned for pairs too.
+        let word = writtenWord.flatMap { emittedScalarCount - $0.count >= barrier ? $0 : nil }
+        var push = PairPush()
+        var fired = false
+        for pair in learnedPairs {
+            let term = pair.term.pieceForm
+            let original = pair.original
+            if previousWord == term || wordSoFar == term { continue }
+            let shared: [Unicode.Scalar]
+            if !endsWord {
+                guard let word, let piece = plainPiece, Self.hasPrefix(term, word),
+                    Self.hasPrefix(original, word + piece), !Self.hasPrefix(term, word + piece)
+                else { continue }
+                shared = word
+            } else if let word, word == original, Self.hasPrefix(term, original), term.count > original.count {
+                shared = original
+            } else if let piece = plainPiece, allowStart {
+                guard Self.hasPrefix(original, piece), !Self.hasPrefix(term, piece) else { continue }
+                shared = []
+            } else {
+                continue
+            }
+            var termContinuations: [Int: Float] = [:]
+            Self.accumulate(
+                from: pair.term, offset: shared.count, idsByPiece: idsByPiece, into: &termContinuations,
+                scale: shared.isEmpty ? 1 : Self.continuationScale)
+            guard !termContinuations.isEmpty else { continue }
+            fired = true
+            for (id, boost) in termContinuations {
+                push.boosts[id] = max(push.boosts[id] ?? -.infinity, boost + Self.learnedPairPush)
+            }
+            push.penalties[plain] = Self.learnedPairPush
+            guard shared.count < original.count else { continue }
+            // Every other piece that would carry on spelling the original
+            // away from the term, so the push does not just move the error
+            // to a neighbouring segmentation.
+            var originalContinuations: [Int: Float] = [:]
+            Self.accumulate(
+                from: Entry(pieceForm: original, boost: 1), offset: shared.count, idsByPiece: idsByPiece,
+                into: &originalContinuations)
+            for id in originalContinuations.keys {
+                guard let piece = pieceById[id], !Self.hasPrefix(term, shared + Array(piece.unicodeScalars))
+                else { continue }
+                push.penalties[id] = Self.learnedPairPush
+            }
+        }
+        return fired ? push : nil
+    }
+
+    /// Near-completion of a learned pair's term: `word` (a `▁`-led written
+    /// word) is the term missing at most its last letter, with at least 3
+    /// letters written (a term of 4+ letters) and not the pair's original
+    /// itself. The term's form and cased tokens, or nil. Only a speculation
+    /// a pair pushed may be committed this way — the tail of a term like
+    /// "Claude" is often acoustically weak (the silent final e).
+    func nearCompletion(of word: [Unicode.Scalar]) -> (form: [Unicode.Scalar], tokens: [Int])? {
+        guard word.first == Self.marker else { return nil }
+        let written = word.dropFirst()
+        guard written.count >= 3 else { return nil }
+        for pair in learnedPairs where word != pair.original {
+            guard let tokens = pair.casedTokens else { continue }
+            let term = pair.term.pieceForm.dropFirst()
+            guard term.count - written.count <= 1, term.starts(with: written),
+                term.last.map({ $0.properties.isAlphabetic }) ?? false
+            else { continue }
+            return (pair.term.pieceForm, tokens)
+        }
+        return nil
+    }
+
+    /// The cased tokens of the learned pair's term spelled exactly `word`,
+    /// or nil.
+    func casedTermTokens(for word: [Unicode.Scalar]) -> [Int]? {
+        learnedPairs.first { $0.term.pieceForm == word }?.casedTokens
+    }
+
+    /// Record that the written word of `writtenLength` scalars now reads as
+    /// `form`, so the no-re-fire rule sees the term. `ended`: a `▁` piece has
+    /// already moved that word into `previousWord`.
+    func renameWrittenWord(to form: [Unicode.Scalar], writtenLength: Int, ended: Bool) {
+        if ended {
+            previousWord = form
+        } else {
+            wordSoFar = form + wordSoFar.dropFirst(writtenLength)
+        }
+    }
+
     // MARK: - Speculation support (start gate + rewind)
 
     /// Everything `observe` mutates, so a speculation can restore it.
@@ -301,12 +528,20 @@ final class NemotronVocabularyBias {
         fileprivate let tail: [Unicode.Scalar]
         fileprivate let tailStart: Int
         fileprivate let barrier: Int
+        fileprivate let previousWord: [Unicode.Scalar]
+        fileprivate let wordSoFar: [Unicode.Scalar]
     }
 
     var matchState: MatchState {
-        get { MatchState(tail: tail, tailStart: tailStart, barrier: barrier) }
+        get {
+            MatchState(
+                tail: tail, tailStart: tailStart, barrier: barrier, previousWord: previousWord,
+                wordSoFar: wordSoFar)
+        }
         set {
             tail = newValue.tail
+            previousWord = newValue.previousWord
+            wordSoFar = newValue.wordSoFar
             tailStart = newValue.tailStart
             barrier = newValue.barrier
             invalidate()
@@ -328,6 +563,19 @@ final class NemotronVocabularyBias {
     /// gate only lets a fresh term open where the model itself opens a word.
     func isWordStart(_ tokenId: Int) -> Bool {
         pieceById[tokenId]?.unicodeScalars.first == Self.marker
+    }
+
+    /// Whether `tokenId` is a text piece (not a special such as a lang tag).
+    func isText(_ tokenId: Int) -> Bool {
+        pieceById[tokenId] != nil
+    }
+
+    /// Whether `tokenId` is an unmarked piece with no letter or digit (`.`,
+    /// `,`, `?`): it ends the word being written as surely as a `▁` piece.
+    func isWordEndingPunctuation(_ tokenId: Int) -> Bool {
+        guard let piece = pieceById[tokenId], let first = piece.unicodeScalars.first, first != Self.marker
+        else { return false }
+        return piece.unicodeScalars.allSatisfy { !$0.properties.isAlphabetic && $0.properties.numericType == nil }
     }
 
     /// Match status of a speculation that began at absolute scalar
@@ -444,6 +692,18 @@ final class NemotronVocabularyBias {
     }
 }
 
+/// A learned correction: the user edited `original` (what the decoder
+/// wrote) to `term`. See `StreamingNemotronMultilingualAsrManager.setLearnedPairs`.
+public struct NemotronLearnedPair: Sendable, Hashable {
+    public let original: String
+    public let term: String
+
+    public init(original: String, term: String) {
+        self.original = original
+        self.term = term
+    }
+}
+
 /// `FLUIDAUDIO_BIAS_LOG=1` traces every boosted flip on stderr — which
 /// piece the plain argmax wanted, which the vocabulary promoted, and both
 /// logits. Off by default; diagnostic rigs read it to attribute
@@ -462,8 +722,9 @@ extension StreamingNemotronMultilingualAsrManager {
     /// the vocabulary is (re)bound whenever a tokenizer becomes available.
     ///
     /// `weight` is a per-token log-prob bonus; most terms should omit it
-    /// (default 4.5). Weights above `NemotronVocabularyBias.maxBoost` are
-    /// treated as legacy CTC-scale values and fall back to the default.
+    /// (default 4.5). Weights above `NemotronVocabularyBias.maxBoost` (6.0)
+    /// are clamped to it — including the 10.0 the simple text-list loader
+    /// assigns.
     /// Biasing requires a logits-producing step decoder: one is loaded
     /// lazily from the model directory when the tier priority skipped it,
     /// and when none exists the vocabulary is rejected with an error log
@@ -476,6 +737,20 @@ extension StreamingNemotronMultilingualAsrManager {
         vocabularyTerms = terms
         biasSession = nil
         await rebuildVocabularyBias()
+    }
+
+    /// Configure learned corrections: each pair's `term` gets an extra push
+    /// (`NemotronVocabularyBias.learnedPairPush`) at exactly the point the
+    /// decode, writing `original`, leaves the term's spelling — and a pushed
+    /// word that ends one letter short of its term is committed as the term.
+    /// A pair applies only while its term is also in the custom vocabulary,
+    /// and only for single words in a space-delimited script. Pass an empty
+    /// list to disable. Like `setCustomVocabulary`, call it between
+    /// utterances; the pairs survive `reset()` and vocabulary changes.
+    public func setLearnedPairs(_ pairs: [NemotronLearnedPair]) async {
+        learnedPairs = pairs
+        biasSession = nil
+        vocabularyBias?.setLearnedPairs(pairs)
     }
 
     /// Bind the stored terms to the loaded tokenizer. Called from the model
@@ -509,13 +784,12 @@ extension StreamingNemotronMultilingualAsrManager {
                     + "decoder_joint_noencproj or decoder_joint asset to enable it.")
             return
         }
-        let legacyWeights = vocabularyTerms.filter { ($0.weight ?? 0) > NemotronVocabularyBias.maxBoost }
-        if !legacyWeights.isEmpty {
+        let clampedWeights = vocabularyTerms.filter { ($0.weight ?? 0) > NemotronVocabularyBias.maxBoost }
+        if !clampedWeights.isEmpty {
             logger.warning(
-                "Custom vocabulary: \(legacyWeights.count) term(s) with weight > "
-                    + "\(NemotronVocabularyBias.maxBoost) use the \(NemotronVocabularyBias.defaultBoost) "
-                    + "default instead (a weight that large is a CTC rescoring value, not a per-token "
-                    + "logit bonus)")
+                "Custom vocabulary: \(clampedWeights.count) term(s) with weight > "
+                    + "\(NemotronVocabularyBias.maxBoost) are clamped to it (the weight is a per-token "
+                    + "logit bonus here, not a CTC rescoring value)")
         }
         // The multilingual wrapper hides the base vocabulary map, but ids
         // are contiguous and `rawToken(for:)` is exact — rebuild the table.
@@ -527,6 +801,7 @@ extension StreamingNemotronMultilingualAsrManager {
             }
         }
         vocabularyBias = NemotronVocabularyBias(terms: vocabularyTerms, pieces: pieces)
+        vocabularyBias?.setLearnedPairs(learnedPairs)
         if vocabularyBias == nil {
             logger.warning("Custom vocabulary: no usable terms after length/weight guards")
         } else if decoderJointNoEncProj == nil && decoderJointArgmax != nil {

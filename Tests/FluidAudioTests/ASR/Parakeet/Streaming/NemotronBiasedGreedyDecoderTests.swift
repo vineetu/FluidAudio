@@ -91,6 +91,8 @@ final class NemotronBiasedGreedyDecoderTests: XCTestCase {
             case .rewound(let count, _, _):
                 result.ids.removeSubrange(count...)
                 result.frames.removeSubrange(count...)
+            case .replaced:
+                XCTFail("no learned pairs are configured here")
             }
         }
         func drive(until end: Int) {

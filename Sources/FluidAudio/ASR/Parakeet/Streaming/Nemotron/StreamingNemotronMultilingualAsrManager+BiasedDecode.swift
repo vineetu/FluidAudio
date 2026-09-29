@@ -189,12 +189,44 @@ extension StreamingNemotronMultilingualAsrManager {
             {
                 recordDetectedLanguage(NemotronMultilingualTokenizer.stripAngleBrackets(piece))
             }
+        case .replaced(let idsFrom, let timingsFrom, let tokens, let wordEndFrame, let thenEmit):
+            let timings = Self.respelledTimings(
+                tokens, replacing: accumulatedTokenTimings[timingsFrom...], wordEndFrame: wordEndFrame
+            ) { tokenizer.rawToken(for: $0) ?? "" }
+            accumulatedTokenIds.removeSubrange(idsFrom...)
+            accumulatedTokenTimings.removeSubrange(timingsFrom...)
+            accumulatedTokenIds.append(contentsOf: tokens)
+            accumulatedTokenTimings.append(contentsOf: timings)
+            if let (tokenId, frame) = thenEmit {
+                accumulatedTokenIds.append(tokenId)
+                appendTokenTiming(
+                    tokenId, frameInChunk: frame - absoluteFrameBase, tokenizer: tokenizer, observeBias: false)
+            }
         case .rewound(let idsCount, let timingsCount, let frame):
             accumulatedTokenIds.removeSubrange(idsCount...)
             accumulatedTokenTimings.removeSubrange(timingsCount...)
             if let current = session.chunks.last, frame < current.startFrame {
                 session.decoder.noteCrossChunkRewind()
             }
+        }
+    }
+
+    /// Timings for a word re-spelled as `tokens`: the replaced word's time
+    /// span (through absolute `wordEndFrame` when a piece of it has no timing
+    /// yet), spread evenly over the new tokens, so word timings stay where
+    /// the audio was.
+    nonisolated internal static func respelledTimings(
+        _ tokens: [Int], replacing replaced: ArraySlice<TokenTiming>, wordEndFrame: Int?,
+        piece: (Int) -> String
+    ) -> [TokenTiming] {
+        let frameSeconds = ASRConstants.secondsPerEncoderFrame
+        let spanEnd = max(replaced.last?.endTime ?? 0, wordEndFrame.map { Double($0 + 1) * frameSeconds } ?? 0)
+        let spanStart = replaced.first?.startTime ?? max(0, spanEnd - frameSeconds)
+        let step = max(spanEnd - spanStart, frameSeconds) / Double(max(tokens.count, 1))
+        return tokens.enumerated().map { index, tokenId in
+            let start = spanStart + Double(index) * step
+            return TokenTiming(
+                token: piece(tokenId), tokenId: tokenId, startTime: start, endTime: start + step, confidence: 1.0)
         }
     }
 
